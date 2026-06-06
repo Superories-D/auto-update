@@ -28,6 +28,20 @@ chmod +x setup.sh
 - 每日 systemd timer 执行时间和随机延迟
 - 是否安装/更新 timer，是否部署后立刻执行一次
 
+如果用 `root` 执行，timer 会自动安装为系统级 unit：
+
+```bash
+systemctl list-timers ese-auto-updater.timer
+journalctl -u ese-auto-updater.service -n 100 --no-pager
+```
+
+如果普通用户有可用的 user systemd bus，则会安装为用户级 unit：
+
+```bash
+systemctl --user list-timers ese-auto-updater.timer
+journalctl --user -u ese-auto-updater.service -n 100 --no-pager
+```
+
 ESE 仓库默认自动匹配上级目录的 `ESE`：
 
 ```text
@@ -102,11 +116,18 @@ GIT_PROXY_URL=
 ## 查看定时任务
 
 ```bash
+systemctl list-timers ese-auto-updater.timer
+journalctl -u ese-auto-updater.service -n 100 --no-pager
+```
+
+普通用户级 timer 使用：
+
+```bash
 systemctl --user list-timers ese-auto-updater.timer
 journalctl --user -u ese-auto-updater.service -n 100 --no-pager
 ```
 
-如果服务器需要用户退出登录后 timer 仍然运行，可以让管理员执行：
+如果普通用户级 timer 需要用户退出登录后仍然运行，可以让管理员执行：
 
 ```bash
 sudo loginctl enable-linger "$USER"

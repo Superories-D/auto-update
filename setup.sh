@@ -6,12 +6,13 @@ ENV_FILE="$APP_DIR/.env"
 INSTALL_TIMER=1
 RUN_NOW=0
 NON_INTERACTIVE=0
+TIMER_BACKEND=auto
 
 usage() {
   cat <<USAGE
-Usage: ./setup.sh [--env-file PATH] [--no-timer] [--run-now] [--non-interactive]
+Usage: ./setup.sh [--env-file PATH] [--timer-backend auto|user|system] [--no-timer] [--run-now] [--non-interactive]
 
-Installs Python dependencies, writes updater settings to .env, and creates a user systemd timer by default.
+Installs Python dependencies, writes updater settings to .env, and creates a systemd timer by default.
 USAGE
 }
 
@@ -19,6 +20,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --env-file)
       ENV_FILE="$2"
+      shift
+      ;;
+    --timer-backend)
+      TIMER_BACKEND="$2"
       shift
       ;;
     --no-timer)
@@ -42,6 +47,16 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+case "$TIMER_BACKEND" in
+  auto|user|system)
+    ;;
+  *)
+    echo "Invalid --timer-backend: $TIMER_BACKEND" >&2
+    usage
+    exit 2
+    ;;
+esac
 
 if [[ "$ENV_FILE" != /* ]]; then
   ENV_FILE="$APP_DIR/$ENV_FILE"
@@ -148,6 +163,48 @@ prompt_yes_no() {
   esac
 }
 
+choose_timer_backend() {
+  if [[ "$TIMER_BACKEND" != "auto" ]]; then
+    printf '%s' "$TIMER_BACKEND"
+    return
+  fi
+  if [[ "$(id -u)" -eq 0 ]]; then
+    printf 'system'
+    return
+  fi
+  if systemctl --user show-environment >/dev/null 2>&1; then
+    printf 'user'
+    return
+  fi
+  if [[ -d /run/systemd/system ]]; then
+    printf 'system'
+    return
+  fi
+  printf 'none'
+}
+
+install_root_file() {
+  local source_file="$1"
+  local target_file="$2"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    install -m 0644 "$source_file" "$target_file"
+    return
+  fi
+  if ! command -v sudo >/dev/null 2>&1; then
+    echo "sudo is required to install a system timer as a non-root user." >&2
+    exit 1
+  fi
+  sudo install -m 0644 "$source_file" "$target_file"
+}
+
+run_systemctl() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    systemctl "$@"
+    return
+  fi
+  sudo systemctl "$@"
+}
+
 detect_ese_dir() {
   local candidate
   for candidate in "$APP_DIR/../ESE" "$APP_DIR/ESE" "$HOME/ESE"; do
@@ -194,7 +251,7 @@ prompt_env "UPDATE_ON_CALENDAR" "Daily schedule in systemd OnCalendar format"
 prompt_env "RANDOMIZED_DELAY_SEC" "Randomized delay seconds"
 
 if [[ "$INSTALL_TIMER" -eq 1 && "$NON_INTERACTIVE" -eq 0 ]]; then
-  if ! prompt_yes_no "Install or update the systemd user timer?" "Y"; then
+  if ! prompt_yes_no "Install or update the systemd timer?" "Y"; then
     INSTALL_TIMER=0
   fi
 fi
@@ -208,27 +265,38 @@ fi
 chmod +x "$APP_DIR/upload.py"
 
 if [[ "$INSTALL_TIMER" -eq 1 ]]; then
-  USER_SYSTEMD_DIR="$HOME/.config/systemd/user"
-  mkdir -p "$USER_SYSTEMD_DIR"
-
   ON_CALENDAR="$(get_env_value "UPDATE_ON_CALENDAR")"
   RANDOMIZED_DELAY="$(get_env_value "RANDOMIZED_DELAY_SEC")"
   ON_CALENDAR="${ON_CALENDAR:-*-*-* 04:00:00}"
   RANDOMIZED_DELAY="${RANDOMIZED_DELAY:-0}"
 
-  cat > "$USER_SYSTEMD_DIR/ese-auto-updater.service" <<SERVICE
+  BACKEND="$(choose_timer_backend)"
+  SERVICE_TMP="$(mktemp)"
+  TIMER_TMP="$(mktemp)"
+  cleanup_units() {
+    rm -f "$SERVICE_TMP" "$TIMER_TMP"
+  }
+  trap cleanup_units EXIT
+
+  SYSTEM_USER_LINE=""
+  if [[ "$BACKEND" == "system" && "$(id -u)" -ne 0 ]]; then
+    SYSTEM_USER_LINE="User=$(id -un)"
+  fi
+
+  cat > "$SERVICE_TMP" <<SERVICE
 [Unit]
 Description=ESE auto pull and upload new songs
 
 [Service]
 Type=oneshot
+$SYSTEM_USER_LINE
 WorkingDirectory=$APP_DIR
 Environment=PYTHONUNBUFFERED=1
 TimeoutStartSec=infinity
 ExecStart=$APP_DIR/.venv/bin/python $APP_DIR/upload.py run --env-file $ENV_FILE
 SERVICE
 
-  cat > "$USER_SYSTEMD_DIR/ese-auto-updater.timer" <<TIMER
+  cat > "$TIMER_TMP" <<TIMER
 [Unit]
 Description=Run ESE auto updater daily
 
@@ -241,11 +309,37 @@ RandomizedDelaySec=$RANDOMIZED_DELAY
 WantedBy=timers.target
 TIMER
 
-  systemctl --user daemon-reload
-  systemctl --user enable --now ese-auto-updater.timer
-  echo "Installed user timer: ese-auto-updater.timer"
-  echo "Check timer: systemctl --user list-timers ese-auto-updater.timer"
-  echo "View logs: journalctl --user -u ese-auto-updater.service -n 100 --no-pager"
+  case "$BACKEND" in
+    user)
+      USER_SYSTEMD_DIR="$HOME/.config/systemd/user"
+      mkdir -p "$USER_SYSTEMD_DIR"
+      install -m 0644 "$SERVICE_TMP" "$USER_SYSTEMD_DIR/ese-auto-updater.service"
+      install -m 0644 "$TIMER_TMP" "$USER_SYSTEMD_DIR/ese-auto-updater.timer"
+      systemctl --user daemon-reload
+      systemctl --user enable --now ese-auto-updater.timer
+      echo "Installed user timer: ese-auto-updater.timer"
+      echo "Check timer: systemctl --user list-timers ese-auto-updater.timer"
+      echo "View logs: journalctl --user -u ese-auto-updater.service -n 100 --no-pager"
+      ;;
+    system)
+      if [[ ! -d /run/systemd/system ]]; then
+        echo "System systemd is not available. Timer was not installed." >&2
+        exit 1
+      fi
+      install_root_file "$SERVICE_TMP" "/etc/systemd/system/ese-auto-updater.service"
+      install_root_file "$TIMER_TMP" "/etc/systemd/system/ese-auto-updater.timer"
+      run_systemctl daemon-reload
+      run_systemctl enable --now ese-auto-updater.timer
+      echo "Installed system timer: ese-auto-updater.timer"
+      echo "Check timer: systemctl list-timers ese-auto-updater.timer"
+      echo "View logs: journalctl -u ese-auto-updater.service -n 100 --no-pager"
+      ;;
+    *)
+      echo "No usable systemd backend found. Timer was not installed." >&2
+      echo "Try running as root, or use: sudo ./setup.sh --timer-backend system" >&2
+      exit 1
+      ;;
+  esac
 fi
 
 if [[ "$RUN_NOW" -eq 1 ]]; then
